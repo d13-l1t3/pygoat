@@ -1,9 +1,16 @@
-from flask import Flask, render_template, request, make_response
-import pickle
+from flask import Flask, render_template, request
 import base64
-from dataclasses import dataclass
+import hashlib
+import hmac
+import json
+import os
+from dataclasses import asdict, dataclass
 
 app = Flask(__name__)
+
+# Key used to sign tokens. Random per process unless provided through the environment,
+# so a client can never compute a valid signature for a modified token.
+TOKEN_KEY = os.environ.get("TOKEN_SIGNING_KEY", "").encode() or os.urandom(32)
 
 
 @dataclass
@@ -11,9 +18,33 @@ class User:
     username: str
     is_admin: bool = False
 
-    def __reduce__(self):
-        # Intentionally vulnerable __reduce__ method to match PyGoat
-        return (User, (self.username, self.is_admin))
+
+def _sign(payload: bytes) -> str:
+    return hmac.new(TOKEN_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def dump_token(user: User) -> str:
+    """Serialize a user as JSON (data only, no code) and sign it."""
+    payload = base64.urlsafe_b64encode(json.dumps(asdict(user)).encode())
+    return f"{payload.decode()}.{_sign(payload)}"
+
+
+def load_token(token: str) -> User:
+    """Verify the signature first, then parse JSON and validate every field."""
+    payload, _, signature = token.strip().rpartition(".")
+    if not payload or not hmac.compare_digest(
+        signature.encode(), _sign(payload.encode()).encode()
+    ):
+        raise ValueError("Invalid token signature")
+
+    data = json.loads(base64.urlsafe_b64decode(payload))
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("username"), str)
+        or not isinstance(data.get("is_admin"), bool)
+    ):
+        raise ValueError("Invalid token content")
+    return User(username=data["username"], is_admin=data["is_admin"])
 
 
 @app.route("/")
@@ -26,8 +57,8 @@ def serialize_data():
     username = request.form.get("username", "guest")
     # Create regular user with admin=False
     user = User(username=username, is_admin=False)
-    # Match PyGoat's serialization format
-    serialized = base64.b64encode(pickle.dumps(user)).decode()
+    # Fixed: JSON + HMAC signature instead of pickle
+    serialized = dump_token(user)
     return render_template("result.html", serialized=serialized)
 
 
@@ -35,19 +66,17 @@ def serialize_data():
 def deserialize_data():
     try:
         serialized_data = request.form.get("serialized_data", "")
-        decoded_data = base64.b64decode(serialized_data)
-        # Intentionally vulnerable deserialization, matching PyGoat
-        user = pickle.loads(decoded_data)
+        # Fixed: pickle.loads() executed attacker-controlled bytecode and trusted
+        # the is_admin flag. JSON cannot execute code, and the signature makes
+        # the token tamper-proof.
+        user = load_token(serialized_data)
 
-        if isinstance(user, User):
-            if user.is_admin:
-                message = f"Welcome Admin {user.username}! Here's the secret admin content: ADMIN_KEY_123"
-            else:
-                message = (
-                    f"Welcome {user.username}. Only admins can see the secret content."
-                )
+        if user.is_admin:
+            message = f"Welcome Admin {user.username}! Here's the secret admin content: ADMIN_KEY_123"
         else:
-            message = "Invalid user data"
+            message = (
+                f"Welcome {user.username}. Only admins can see the secret content."
+            )
 
         return render_template("result.html", message=message)
     except Exception as e:
