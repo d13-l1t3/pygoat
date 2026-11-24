@@ -86,3 +86,72 @@ jobs:
       with:
         name: docker-scout-findings
         path: scout-report.sarif
+
+  dast_scan:
+    name: Deploy PyGoat and Run ZAP Scan
+    runs-on: ubuntu-latest
+    # Run after the static scans, but do not skip when they fail:
+    # sast_scan and image_scan are EXPECTED to fail on a vulnerable app,
+    # and a plain `needs` would skip this job in that case.
+    needs: [sast_scan, image_scan]
+    if: ${{ !cancelled() }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build PyGoat image from this repository
+      run: docker build -f Dockerfile -t pygoat:ci .
+
+    - name: Deploy PyGoat
+      # db.sqlite3 is excluded by .dockerignore, so apply migrations before starting gunicorn
+      run: |
+        docker run -d --name pygoat -p 8000:8000 pygoat:ci \
+          sh -c "python manage.py migrate --noinput && gunicorn --bind 0.0.0.0:8000 --workers 2 --worker-class gthread --threads 4 --timeout 600 pygoat.wsgi"
+
+    - name: Wait until the application is healthy
+      run: |
+        for i in $(seq 1 60); do
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ || true)
+          if [ "$code" = "200" ] || [ "$code" = "301" ] || [ "$code" = "302" ]; then
+            echo "PyGoat is up (HTTP $code) after ~$((i * 3))s"
+            exit 0
+          fi
+          echo "attempt $i: HTTP $code, waiting..."
+          sleep 3
+        done
+        echo "PyGoat did not start in time"
+        docker logs pygoat
+        exit 1
+
+    - name: Run OWASP ZAP baseline scan
+      # exit codes: 0 = clean, 1 = FAIL rules, 2 = WARN rules -> job fails when something is found
+      run: |
+        mkdir -p zap-out && chmod 777 zap-out
+        docker run --rm --network host \
+          -v "$PWD/zap-out:/zap/wrk:rw" \
+          ghcr.io/zaproxy/zaproxy:stable \
+          zap-baseline.py -t http://localhost:8000 \
+            -r zap-report.html -J zap-report.json -w zap-report.md
+
+    - name: Summarize ZAP report
+      if: always()
+      run: |
+        if [ -f zap-out/zap-report.md ]; then
+          cat zap-out/zap-report.md >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "ZAP report was not generated" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: zap-findings
+        path: zap-out/
+
+    - name: Show application logs and stop it
+      if: always()
+      run: |
+        docker logs pygoat 2>&1 | tail -n 100 || true
+        docker rm -f pygoat || true
